@@ -120,20 +120,54 @@ namespace seastar {
 namespace dpdk {
 
 /******************* Net device related constatns *****************************/
-static constexpr uint16_t default_ring_size      = 512;
+// Auto-tuned at runtime from rte_eth_dev_info / rte_eth_dev_adjust_nb_rx_tx_desc.
+// Initial values are safe fallbacks; tune_ring_sizes() overwrites them in
+// dpdk_device::init_port_start() before any queue/mbuf-pool is created.
+static uint16_t rx_ring_size                     = 512;
+static uint16_t tx_ring_size                     = 512;
 
 //
 // We need 2 times the ring size of buffers because of the way PMDs
 // refill the ring.
 //
-static constexpr uint16_t mbufs_per_queue_rx     = 2 * default_ring_size;
+static uint16_t mbufs_per_queue_rx               = 2 * 512;
 static constexpr uint16_t rx_gc_thresh           = 64;
 
 //
 // No need to keep more descriptors in the air than can be sent in a single
 // rte_eth_tx_burst() call.
 //
-static constexpr uint16_t mbufs_per_queue_tx     = 2 * default_ring_size;
+static uint16_t mbufs_per_queue_tx               = 2 * 512;
+
+// Ask DPDK what ring size this NIC actually wants, then size the mbuf pool
+// accordingly.  Driver-recommended values come from default_{rx,tx}portconf;
+// rte_eth_dev_adjust_nb_rx_tx_desc() clamps/aligns to {nb_min,nb_max,nb_align}.
+//
+// When LRO is enabled, drivers such as BNXT and mlx5 allocate an aggregation
+// ring of ~3x the main ring from the SAME mempool, so the pool must be sized
+// beyond the usual "2x ring" rule.  We use 6x as a safe upper bound that
+// covers ring + agg-ring + per-lcore mempool cache slack.
+static void tune_ring_sizes(uint16_t port_idx, const rte_eth_dev_info& info,
+                            bool lro_enabled) {
+    uint16_t rx = info.default_rxportconf.ring_size
+                      ? info.default_rxportconf.ring_size : 1024;
+    uint16_t tx = info.default_txportconf.ring_size
+                      ? info.default_txportconf.ring_size : 1024;
+    int ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_idx, &rx, &tx);
+    if (ret != 0) {
+        rte_exit(EXIT_FAILURE,
+                 "rte_eth_dev_adjust_nb_rx_tx_desc failed for port %u: %d\n",
+                 port_idx, ret);
+    }
+    rx_ring_size       = rx;
+    tx_ring_size       = tx;
+    uint16_t rx_factor = lro_enabled ? 6 : 2;
+    mbufs_per_queue_rx = rx_factor * rx;
+    mbufs_per_queue_tx = 2 * tx;
+    printf("Port %u: auto-tuned ring rx=%u tx=%u (mbuf pool rx=%u tx=%u, lro=%s)\n",
+           port_idx, rx, tx, mbufs_per_queue_rx, mbufs_per_queue_tx,
+           lro_enabled ? "on" : "off");
+}
 
 static constexpr uint16_t mbuf_cache_size        = 512;
 static constexpr uint16_t mbuf_overhead          =
@@ -1435,6 +1469,14 @@ int dpdk_device::init_port_start()
 
     rte_eth_dev_info_get(_port_idx, &_dev_info);
 
+    // Auto-tune RX/TX ring sizes and mbuf pool sizes from the NIC's own
+    // recommendations.  Must happen before any qp/mempool is created.
+    // Pass the effective LRO state so the RX pool can be enlarged to cover the
+    // aggregation ring that BNXT/mlx5 allocate from the same mempool.
+    tune_ring_sizes(_port_idx, _dev_info,
+                    _use_lro && (_dev_info.rx_offload_capa
+                                 & RTE_ETH_RX_OFFLOAD_TCP_LRO));
+
     //
     // This is a workaround for a missing handling of a HW limitation in the
     // DPDK i40e driver. This and all related to _is_i40e_device code should be
@@ -1936,13 +1978,13 @@ dpdk_qp<HugetlbfsMemBackend>::dpdk_qp(dpdk_device* dev, uint16_t qid,
     static_assert((inline_mbuf_data_size & (inline_mbuf_data_size - 1)) == 0,
                   "inline_mbuf_data_size has to be a power of two!");
 
-    if (rte_eth_rx_queue_setup(_dev->port_idx(), _qid, default_ring_size,
+    if (rte_eth_rx_queue_setup(_dev->port_idx(), _qid, rx_ring_size,
             rte_eth_dev_socket_id(_dev->port_idx()),
             _dev->def_rx_conf(), _pktmbuf_pool_rx) < 0) {
         rte_exit(EXIT_FAILURE, "Cannot initialize rx queue\n");
     }
 
-    if (rte_eth_tx_queue_setup(_dev->port_idx(), _qid, default_ring_size,
+    if (rte_eth_tx_queue_setup(_dev->port_idx(), _qid, tx_ring_size,
             rte_eth_dev_socket_id(_dev->port_idx()), _dev->def_tx_conf()) < 0) {
         rte_exit(EXIT_FAILURE, "Cannot initialize tx queue\n");
     }
