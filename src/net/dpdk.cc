@@ -164,6 +164,16 @@ static void tune_ring_sizes(uint16_t port_idx, const rte_eth_dev_info& info,
     uint16_t rx_factor = lro_enabled ? 6 : 2;
     mbufs_per_queue_rx = rx_factor * rx;
     mbufs_per_queue_tx = 2 * tx;
+    // DPDK mempool requires pool_size >= cache_size * 1.5. On NICs whose
+    // auto-tuned tx ring is small (mlx5 starts at 256 on ConnectX-4),
+    // 2 * tx = 512 falls below the 768 floor for mbuf_cache_size=512 and
+    // rte_mempool_create returns NULL → "Failed to create mempool for Tx".
+    // Floor the pool sizes at 2 * cache_size so the constraint always holds.
+    {
+        constexpr uint16_t pool_floor = 2 * 512;   // 2 * mbuf_cache_size
+        if (mbufs_per_queue_rx < pool_floor) mbufs_per_queue_rx = pool_floor;
+        if (mbufs_per_queue_tx < pool_floor) mbufs_per_queue_tx = pool_floor;
+    }
     printf("Port %u: auto-tuned ring rx=%u tx=%u (mbuf pool rx=%u tx=%u, lro=%s)\n",
            port_idx, rx, tx, mbufs_per_queue_rx, mbufs_per_queue_tx,
            lro_enabled ? "on" : "off");
