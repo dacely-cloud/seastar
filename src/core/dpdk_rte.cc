@@ -53,6 +53,15 @@ void eal::init(cpuset cpus, const std::string& argv0, const std::optional<std::s
         string2vector("-n"), string2vector("1")
     };
 
+    // Allow override of the PCI device whitelist via env var.
+    // SEASTAR_DPDK_ALLOW="0000:17:00.1" → only probe that device.
+    // Useful to skip Broadcom NICs / sibling Mellanox port that may
+    // crash the mlx5 PMD during init.
+    if (const char* allow = std::getenv("SEASTAR_DPDK_ALLOW")) {
+        args.push_back(string2vector("--allow"));
+        args.push_back(string2vector(allow));
+    }
+
     // If "hugepages" is not provided and DPDK PMD drivers mode is requested -
     // use the default DPDK huge tables configuration.
     if (hugepages_path) {

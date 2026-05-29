@@ -44,10 +44,12 @@ if (dpdk_INCLUDE_DIR AND EXISTS "${dpdk_INCLUDE_DIR}/rte_build_config.h")
 endif ()
 
 set(rte_libs
+  bus_auxiliary
   bus_pci
   bus_vdev
   cfgfile
   cmdline
+  common_mlx5
   cryptodev
   eal
   ethdev
@@ -64,6 +66,7 @@ set(rte_libs
   net_enic
   net_i40e
   net_ixgbe
+  net_mlx5
   net_nfp
   net_qede
   net_ring
