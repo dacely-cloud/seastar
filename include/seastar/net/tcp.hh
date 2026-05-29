@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <unordered_map>
 #include <map>
 #include <functional>
@@ -1583,7 +1584,17 @@ packet tcp<InetTraits>::tcb::get_transmit_packet() {
     auto can_send = this->can_send();
     // Max number of TCP payloads we can pass to NIC
     uint32_t len;
-    if (_tcp.hw_features().tx_tso) {
+    // SEASTAR_DISABLE_TSO=1 forces MSS-sized segments out of this code path
+    // even when hw_features().tx_tso is true. mlx5 PMD on ConnectX-4 advertises
+    // TX_TCP_TSO but the oversized frames Seastar builds for it don't survive
+    // the actual transmit path — anything beyond the first packet is lost
+    // somewhere between the NIC and a downstream receiver. Setting this env
+    // var keeps Seastar emitting individual MSS segments instead.
+    static const bool tso_disabled = []{
+        const char* s = std::getenv("SEASTAR_DISABLE_TSO");
+        return s && *s && *s != '0';
+    }();
+    if (_tcp.hw_features().tx_tso && !tso_disabled) {
         // FIXME: Info tap device the size of the splitted packet
         len = _tcp.hw_features().max_packet_len - net::tcp_hdr_len_min - InetTraits::ip_hdr_len_min;
     } else {

@@ -25,6 +25,8 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/util/assert.hh>
 #include <seastar/util/log.hh>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 
 namespace seastar {
 
@@ -292,11 +294,45 @@ keepalive_params native_connected_socket_impl<Protocol>::get_keepalive_parameter
 
 template<typename Protocol>
 void native_connected_socket_impl<Protocol>::set_sockopt(int level, int optname, const void* data, size_t len) {
+    // TCP-level options the native stack treats as best-effort hints
+    // instead of failing the whole connection setup:
+    //
+    //   TCP_CORK     — kernel buffers send until uncork. Native stack
+    //                  already coalesces writes through its packet
+    //                  queue, so cork on/off is informational only.
+    //   TCP_NODELAY  — there's a dedicated set_nodelay() entry point;
+    //                  treat the raw form the same way (no-op).
+    //   TCP_QUICKACK — ACK timing hint; native stack picks its own.
+    //
+    // Anything else still throws so we don't silently lose security
+    // -relevant options (TLS, etc).
+    if (level == IPPROTO_TCP) {
+        switch (optname) {
+            case TCP_CORK:
+            case TCP_NODELAY:
+            case TCP_QUICKACK:
+                return;
+            default:
+                break;
+        }
+    }
     throw std::runtime_error("Setting custom socket options is not supported for native stack");
 }
 
 template<typename Protocol>
 int native_connected_socket_impl<Protocol>::get_sockopt(int level, int optname, void* data, size_t len) const {
+    // Mirror set_sockopt: report 0 for the no-op options instead of throwing.
+    if (level == IPPROTO_TCP && len >= sizeof(int)) {
+        switch (optname) {
+            case TCP_CORK:
+            case TCP_NODELAY:
+            case TCP_QUICKACK:
+                *static_cast<int*>(data) = 0;
+                return 0;
+            default:
+                break;
+        }
+    }
     throw std::runtime_error("Getting custom socket options is not supported for native stack");
 }
 
