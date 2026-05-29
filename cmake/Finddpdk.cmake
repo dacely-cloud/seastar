@@ -44,12 +44,10 @@ if (dpdk_INCLUDE_DIR AND EXISTS "${dpdk_INCLUDE_DIR}/rte_build_config.h")
 endif ()
 
 set(rte_libs
-  bus_auxiliary
   bus_pci
   bus_vdev
   cfgfile
   cmdline
-  common_mlx5
   cryptodev
   eal
   ethdev
@@ -66,7 +64,6 @@ set(rte_libs
   net_enic
   net_i40e
   net_ixgbe
-  net_mlx5
   net_nfp
   net_qede
   net_ring
@@ -78,6 +75,21 @@ set(rte_libs
   security
   telemetry
   timer)
+
+# Mellanox ConnectX (mlx5) PMD is opt-in: requires librte_net_mlx5.a in
+# the system DPDK build plus libibverbs + libmlx5 + libnl at runtime.
+# On many hosts (typical CI, non-Mellanox NICs) these aren't installed,
+# so linking them unconditionally breaks the build. Enable with
+# -DSeastar_DPDK_MLX5=ON when configuring on a host that has them.
+option (Seastar_DPDK_MLX5
+  "Link the mlx5 PMD (Mellanox ConnectX-4/5/6) into Seastar's DPDK bundle"
+  OFF)
+if (Seastar_DPDK_MLX5)
+  list (APPEND rte_libs
+    bus_auxiliary
+    common_mlx5
+    net_mlx5)
+endif ()
 # sfc_efx driver can only build on x86 and aarch64
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "amd64|x86_64|aarch64")
   list (APPEND rte_libs

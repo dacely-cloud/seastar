@@ -280,6 +280,10 @@ option (Seastar_DPDK
   "Enable DPDK support."
   OFF)
 
+option (Seastar_NATIVE_LENIENT_SOCKOPTS
+  "Treat unsupported TCP_CORK/TCP_NODELAY/TCP_QUICKACK setsockopt calls on the native stack as no-ops instead of throwing. Useful for porting kernel-stack code that calls setsockopt() expecting it to be a best-effort hint."
+  OFF)
+
 option (Seastar_EXCLUDE_APPS_FROM_ALL
   "When enabled alongside Seastar_APPS, do not build applications by default."
   OFF)
@@ -1112,6 +1116,11 @@ if (Seastar_DPDK)
   endif ()
   target_compile_definitions (seastar
     PUBLIC SEASTAR_HAVE_DPDK)
+endif ()
+
+if (Seastar_NATIVE_LENIENT_SOCKOPTS)
+  target_compile_definitions (seastar
+    PUBLIC SEASTAR_NATIVE_LENIENT_SOCKOPTS=1)
 endif ()
 
 if (Seastar_HWLOC)

@@ -292,20 +292,19 @@ keepalive_params native_connected_socket_impl<Protocol>::get_keepalive_parameter
     return tcp_keepalive_params {std::chrono::seconds(0), std::chrono::seconds(0), 0};
 }
 
+// Opt-in: silently accept TCP-level setsockopt calls the native stack
+// doesn't really implement. Off by default so existing applications
+// that *expect* an exception when they hit unsupported sockopts still
+// get one. Enable when porting kernel-stack code that calls
+// setsockopt(TCP_CORK / TCP_NODELAY / TCP_QUICKACK) and you'd rather
+// treat them as best-effort hints than rewrite the call sites.
+#ifndef SEASTAR_NATIVE_LENIENT_SOCKOPTS
+#define SEASTAR_NATIVE_LENIENT_SOCKOPTS 0
+#endif
+
 template<typename Protocol>
 void native_connected_socket_impl<Protocol>::set_sockopt(int level, int optname, const void* data, size_t len) {
-    // TCP-level options the native stack treats as best-effort hints
-    // instead of failing the whole connection setup:
-    //
-    //   TCP_CORK     — kernel buffers send until uncork. Native stack
-    //                  already coalesces writes through its packet
-    //                  queue, so cork on/off is informational only.
-    //   TCP_NODELAY  — there's a dedicated set_nodelay() entry point;
-    //                  treat the raw form the same way (no-op).
-    //   TCP_QUICKACK — ACK timing hint; native stack picks its own.
-    //
-    // Anything else still throws so we don't silently lose security
-    // -relevant options (TLS, etc).
+#if SEASTAR_NATIVE_LENIENT_SOCKOPTS
     if (level == IPPROTO_TCP) {
         switch (optname) {
             case TCP_CORK:
@@ -316,12 +315,13 @@ void native_connected_socket_impl<Protocol>::set_sockopt(int level, int optname,
                 break;
         }
     }
+#endif
     throw std::runtime_error("Setting custom socket options is not supported for native stack");
 }
 
 template<typename Protocol>
 int native_connected_socket_impl<Protocol>::get_sockopt(int level, int optname, void* data, size_t len) const {
-    // Mirror set_sockopt: report 0 for the no-op options instead of throwing.
+#if SEASTAR_NATIVE_LENIENT_SOCKOPTS
     if (level == IPPROTO_TCP && len >= sizeof(int)) {
         switch (optname) {
             case TCP_CORK:
@@ -333,6 +333,7 @@ int native_connected_socket_impl<Protocol>::get_sockopt(int level, int optname, 
                 break;
         }
     }
+#endif
     throw std::runtime_error("Getting custom socket options is not supported for native stack");
 }
 
