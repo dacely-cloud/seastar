@@ -3721,6 +3721,9 @@ void smp_message_queue::move_pending() {
     }
     auto nr = end - begin;
     _pending.maybe_wakeup();
+    // Tell the receiver "shard _send_id has pending work for you". The
+    // receiver's poll_queues() can short-circuit when its whole bitmap is 0.
+    smp::_this_smp->notify_pending(_recv_id, _send_id);
     _tx.a.pending_fifo.erase(begin, end);
     _current_queue_length += nr;
     _last_snt_batch = nr;
@@ -3771,6 +3774,10 @@ void smp_message_queue::flush_response_batch() {
             return;
         }
         _completed.maybe_wakeup();
+        // The completion travels back to the original sender of the work
+        // item (recipient of our _completed). Notify them in their bitmap
+        // so their poll_queues() picks the completion up promptly.
+        smp::_this_smp->notify_pending(_send_id, _recv_id);
         _completed_fifo.erase(begin, end);
     }
 }
@@ -4710,6 +4717,9 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
     seastar_logger.info("Reactor backend: {}", backend_selector);
 
     _qs_owner = decltype(smp::_qs_owner){new smp_message_queue* [_shard_count], qs_deleter{}};
+    // One bitmap per shard. Allocated heap because _shard_count is runtime.
+    // Storage is initialized to zero by std::atomic's default initializer.
+    _pending_bits = std::make_unique<shard_pending_bits[]>(_shard_count);
 
     auto allocate_qs_owner = [this] (unsigned i) {
         // smp_message_queue has members with hefty alignment requirements.
@@ -4724,7 +4734,11 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 
     auto allocate_smp_queues = [this, &reactors] (unsigned i) {
         for (unsigned j = 0; j < _shard_count; ++j) {
+            // _qs_owner[i][j] is the queue between shards j (sender) and i
+            // (receiver). Store coordinates so move_pending() /
+            // flush_response_batch() can notify the right receiver's bitmap.
             new (&smp::_qs_owner[i][j]) smp_message_queue(reactors[j], reactors[i]);
+            smp::_qs_owner[i][j].set_coords(j, i);
         }
     };
 
@@ -4822,18 +4836,43 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 }
 
 bool smp::poll_queues() {
+    auto me = this_shard_id();
+    auto shard_count = this_smp_shard_count();
     size_t got = 0;
-    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
-        if (this_shard_id() != i) {
-            auto& rxq = _qs[this_shard_id()][i];
-            rxq.flush_response_batch();
-            got += rxq.has_unflushed_responses();
+
+    // First, flush any work or completions we built locally this tick. These
+    // touch only LOCAL fifos (cache lines we own); cost is one branch on
+    // emptiness per peer. We have to do this every tick to push our own
+    // outgoing batches even when no peer has notified us.
+    for (unsigned i = 0; i < shard_count; i++) {
+        if (i == me) continue;
+        _qs[me][i].flush_response_batch();
+        _qs[i][me].flush_request_batch();
+        got += _qs[me][i].has_unflushed_responses();
+    }
+
+    // Now the hot fast path: read our own pending-senders bitmap. Each word
+    // is a cache line we OWN; if all words are 0 (the common case for an
+    // HTTP server where shards don't talk to each other) we exit without
+    // touching any remote shard's memory.
+    auto& my_bitmap = smp::_this_smp->_pending_bits[me].bits;
+    bool had_any = false;
+    for (size_t w = 0; w < smp::pending_bits_words; w++) {
+        uint64_t bits = my_bitmap[w].exchange(0, std::memory_order_acquire);
+        if (!bits) continue;
+        had_any = true;
+        while (bits) {
+            unsigned bit = __builtin_ctzll(bits);
+            bits &= bits - 1;
+            unsigned peer = unsigned(w) * 64 + bit;
+            if (peer >= shard_count || peer == me) continue;
+            auto& rxq = _qs[me][peer];
             got += rxq.process_incoming();
-            auto& txq = _qs[i][this_shard_id()];
-            txq.flush_request_batch();
-            got += txq.process_completions(i);
+            auto& txq = _qs[peer][me];
+            got += txq.process_completions(peer);
         }
     }
+    (void)had_any;
     return got != 0;
 }
 

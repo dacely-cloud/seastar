@@ -267,8 +267,17 @@ class smp_message_queue {
         } a;
     } _tx;
     std::vector<work_item*> _completed_fifo;
+    // Coordinates of this queue in smp::_qs[recv][send]. Used to set the
+    // per-receiver "pending senders" bitmap so smp::poll_queues() can skip
+    // the O(N) per-peer scan when no peer has sent us anything.
+    shard_id _send_id = 0;
+    shard_id _recv_id = 0;
 public:
     smp_message_queue(reactor* from, reactor* to);
+    void set_coords(shard_id send_id, shard_id recv_id) noexcept {
+        _send_id = send_id;
+        _recv_id = recv_id;
+    }
     ~smp_message_queue();
     template <typename Func>
     futurize_t<std::invoke_result_t<Func>> submit(shard_id t, smp_submit_to_options options, Func&& func) noexcept {
@@ -324,9 +333,40 @@ class smp : public std::enable_shared_from_this<smp> {
     std::unique_ptr<smp_message_queue*[], qs_deleter> _qs_owner;
     static thread_local smp_message_queue**_qs;
     static thread_local std::thread::id _tmain;
+public:
+    // Made public so smp_message_queue (which holds per-pair state) can
+    // call notify_pending() through it. Was thread_local private.
     static inline thread_local smp* _this_smp = nullptr;
+private:
     bool _using_dpdk = false;
     std::vector<unsigned> _shard_to_numa_node_mapping;
+
+public:
+    // Per-receiver bitmap of senders that have posted work or a completion
+    // to the receiver since it last drained. The receiver checks its own
+    // bitmap (local cache line) before iterating the full N-1 peer queues
+    // in smp::poll_queues(), so the common case (nobody posting to us) costs
+    // a single atomic load instead of N remote cache-line reads.
+    //
+    // Bit `s` in _pending_bits[r] is set when shard `s` enqueues into a
+    // queue owned by receiver `r`. Receiver atomically swaps each word with
+    // 0 when consuming.
+    static constexpr size_t pending_bits_words = 4;     // up to 256 shards
+    struct alignas(seastar::cache_line_size) shard_pending_bits {
+        std::atomic<uint64_t> bits[pending_bits_words]{};
+    };
+private:
+    std::unique_ptr<shard_pending_bits[]> _pending_bits;  // [_shard_count]
+
+public:
+    // Called by senders after enqueueing into a remote queue. Sets `sender`
+    // in the bitmap that `recv` checks every reactor tick. Release memory
+    // ordering pairs with the receiver's acquire load + exchange.
+    inline void notify_pending(shard_id recv, shard_id sender) noexcept {
+        _pending_bits[recv].bits[sender >> 6]
+            .fetch_or(uint64_t(1) << (sender & 63),
+                      std::memory_order_release);
+    }
 
 private:
     void setup_prefaulter(const seastar::resource::resources& res, seastar::memory::internal::numa_layout layout);
