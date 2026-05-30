@@ -37,6 +37,7 @@
 #include <seastar/core/queue.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/byteorder.hh>
+#include <seastar/core/align.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/net/net.hh>
 #include <seastar/net/ip_checksum.hh>
@@ -95,9 +96,71 @@ void tcp_debug(const char* fmt, Args&&... args) {
 #endif
 }
 
+// --- Small RFC helpers, pulled out as free functions so they can be unit
+// tested without instantiating the full TCP template. -------------------
+
+// RFC 6928 IW10: IW = min(10*MSS, max(2*MSS, 14600)).
+// For MSS=1460 this yields exactly 14600 (10 segments), the modern default.
+// For MSS<=1095 the lower bound 14600 still wins. For MSS>7300 the 10*MSS
+// ceiling is below the 2*MSS floor's headroom and 2*MSS dominates.
+constexpr uint32_t initial_cwnd_for_mss(uint32_t mss) noexcept {
+    return std::min<uint32_t>(10u * mss,
+                              std::max<uint32_t>(2u * mss, 14600u));
+}
+
+// RFC 9293 / RFC 6691: the actual TCP send MSS is the minimum of the peer's
+// announced MSS and the largest segment we can put on our local interface.
+constexpr uint16_t clamp_send_mss(uint16_t remote_mss, uint16_t local_mss) noexcept {
+    return std::min(remote_mss, local_mss);
+}
+
+// RFC 7323 §2.3: window scale shift count is capped at 14. Values above 14
+// (which would overflow the 16-bit window field on shift) must be treated
+// as 14.
+constexpr uint8_t clamp_window_scale(uint8_t shift) noexcept {
+    return shift > 14 ? 14 : shift;
+}
+
+// Compile-time tests for the three RFC helpers above. These always run at
+// build time so any regression in the formulas fails the build immediately,
+// independent of whether the unit-test target is built.
+// IW10 (RFC 6928): IW = min(10*MSS, max(2*MSS, 14600))
+// MSS=1460 hits exactly 14600 = 10*MSS, the modern default.
+// Larger MSS: 2*MSS floor wins (jumbo connections start with fewer but
+// bigger segments). Smaller MSS: 10*MSS ceiling wins (10 small segments
+// is less than the 14600-byte floor).
+static_assert(initial_cwnd_for_mss(1460) == 14600,
+              "IW10: standard MSS yields exactly 10 segments");
+static_assert(initial_cwnd_for_mss(9060) == 18120,
+              "IW10: jumbo MSS yields 2*MSS (2 segments)");
+static_assert(initial_cwnd_for_mss(536) == 5360,
+              "IW10: tiny MSS yields 10*MSS");
+static_assert(initial_cwnd_for_mss(1461) == 14600,
+              "IW10: 14600 ceiling holds for MSS just above standard");
+// clamp_send_mss (RFC 9293)
+static_assert(clamp_send_mss(16294, 1460) == 1460,
+              "send MSS must be capped at our local MSS");
+static_assert(clamp_send_mss(1460, 9060) == 1460,
+              "smaller peer MSS wins");
+static_assert(clamp_send_mss(536, 1460) == 536,
+              "tiny peer MSS still wins");
+// clamp_window_scale (RFC 7323 §2.3)
+static_assert(clamp_window_scale(0) == 0,
+              "wscale 0 unchanged");
+static_assert(clamp_window_scale(14) == 14,
+              "wscale 14 unchanged (RFC limit)");
+static_assert(clamp_window_scale(15) == 14,
+              "wscale above 14 must clamp to 14");
+static_assert(clamp_window_scale(255) == 14,
+              "wscale max must clamp to 14");
+
 struct tcp_option {
     // The kind and len field are fixed and defined in TCP protocol
-    enum class option_kind: uint8_t { mss = 2, win_scale = 3, sack = 4, timestamps = 8,  nop = 1, eol = 0 };
+    // RFC numbering: kind 4 is SACK-Permitted, kind 5 is SACK blocks. Seastar
+    // historically called the permitted-bit "sack"; the new kind 5 is added
+    // here as `sack_blocks` and emitted in non-SYN ACKs when we have
+    // out-of-order data to report.
+    enum class option_kind: uint8_t { mss = 2, win_scale = 3, sack = 4, sack_blocks = 5, timestamps = 8,  nop = 1, eol = 0 };
     enum class option_len:  uint8_t { mss = 4, win_scale = 3, sack = 2, timestamps = 10, nop = 1, eol = 1 };
     static void write(char* p, option_kind kind, option_len len) {
         p[0] = static_cast<uint8_t>(kind);
@@ -176,9 +239,9 @@ struct tcp_option {
     };
     static const uint8_t align = 4;
 
-    void parse(uint8_t* beg, uint8_t* end);
-    uint8_t fill(void* h, const tcp_hdr* th, uint8_t option_size);
-    uint8_t get_size(bool syn_on, bool ack_on);
+    inline void parse(uint8_t* beg, uint8_t* end);
+    inline uint8_t fill(void* h, const tcp_hdr* th, uint8_t option_size);
+    inline uint8_t get_size(bool syn_on, bool ack_on);
 
     // For option negotiattion
     bool _mss_received = false;
@@ -191,6 +254,15 @@ struct tcp_option {
     uint16_t _local_mss;
     uint8_t _remote_win_scale = 0;
     uint8_t _local_win_scale = 0;
+
+    // Outgoing SACK block state (RFC 2018). Populated by the tcb's
+    // output_one() from its receive-side out-of-order queue before each
+    // outgoing segment; consumed by get_size()/fill(). Raw fields hold
+    // host-order tcp_seq values that will be byte-swapped on the wire.
+    static constexpr unsigned sack_max_blocks = 4;
+    struct sack_block_out { uint32_t left, right; };
+    sack_block_out _sack_blocks_out[sack_max_blocks]{};
+    uint8_t _sack_nblocks_out = 0;
 };
 inline char*& operator+=(char*& x, tcp_option::option_len len) { x += uint8_t(len); return x; }
 inline const char*& operator+=(const char*& x, tcp_option::option_len len) { x += uint8_t(len); return x; }
@@ -288,6 +360,153 @@ struct tcp_hdr {
 
 struct tcp_tag {};
 using tcp_packet_merger = packet_merger<tcp_seq, tcp_tag>;
+
+// --- tcp_option inline definitions ---------------------------------------
+// Defined out-of-line so they appear after tcp_hdr above. Inline so they're
+// linkable from unit tests without depending on libseastar.a (which pulls
+// in the entire DPDK static set).
+
+inline void tcp_option::parse(uint8_t* beg1, uint8_t* end1) {
+    const char* beg = reinterpret_cast<const char*>(beg1);
+    const char* end = reinterpret_cast<const char*>(end1);
+    while (beg < end) {
+        auto kind = option_kind(*beg);
+        if (kind != option_kind::nop && kind != option_kind::eol) {
+            // Make sure there is enough room for this option
+            auto len = uint8_t(beg[1]);
+            if (beg + len > end) {
+                return;
+            }
+        }
+        switch (kind) {
+        case option_kind::mss:
+            _mss_received = true;
+            _remote_mss = mss::read(beg).mss;
+            beg += option_len::mss;
+            break;
+        case option_kind::win_scale:
+            _win_scale_received = true;
+            _remote_win_scale = win_scale::read(beg).shift;
+            // We can turn on win_scale option, 7 is Linux's default win scale size
+            _local_win_scale = 7;
+            beg += option_len::win_scale;
+            break;
+        case option_kind::sack:
+            _sack_received = true;
+            beg += option_len::sack;
+            break;
+        case option_kind::nop:
+            beg += option_len::nop;
+            break;
+        case option_kind::eol:
+            return;
+        default:
+            // Ignore options we do not understand
+            uint8_t len = *(beg + 1);
+            beg += len;
+            // Prevent infinite loop
+            if (len == 0) {
+                return;
+            }
+            break;
+        }
+    }
+}
+
+inline uint8_t tcp_option::fill(void* h, const tcp_hdr* th, uint8_t options_size) {
+    auto hdr = reinterpret_cast<char*>(h);
+    auto off = hdr + tcp_hdr::len;
+    uint8_t size = 0;
+    bool syn_on = th->f_syn;
+    bool ack_on = th->f_ack;
+
+    if (syn_on) {
+        if (_mss_received || !ack_on) {
+            auto mss = tcp_option::mss();
+            mss.mss = _local_mss;
+            mss.write(off);
+            off += mss.len;
+            size += mss.len;
+        }
+        if (_win_scale_received || !ack_on) {
+            auto win_scale = tcp_option::win_scale();
+            win_scale.shift = _local_win_scale;
+            win_scale.write(off);
+            off += win_scale.len;
+            size += win_scale.len;
+        }
+        // RFC 2018: advertise SACK_PERMITTED on SYN whenever we initiated the
+        // connection (active open) or the peer's SYN had it set (passive
+        // open). Without this Seastar's peer thinks SACK isn't supported and
+        // never sends SACK blocks back, so we lose fast recovery on the
+        // receiver side.
+        if (_sack_received || !ack_on) {
+            auto sp = tcp_option::sack();
+            sp.write(off);
+            off += sp.len;
+            size += sp.len;
+        }
+    } else if (_sack_nblocks_out > 0) {
+        // RFC 2018: SACK blocks on a non-SYN segment. Layout:
+        //   NOP NOP  | kind=5 len=2+8N | (left right)+
+        // The two leading NOPs align the SACK header on a 32-bit boundary,
+        // matching Linux's wire format. Total bytes = 4 + 8*N (already aligned).
+        auto nop = tcp_option::nop();
+        nop.write(off); ++off; ++size;
+        nop.write(off); ++off; ++size;
+        uint8_t sack_len = 2 + 8 * _sack_nblocks_out;
+        off[0] = uint8_t(option_kind::sack_blocks);
+        off[1] = sack_len;
+        off += 2; size += 2;
+        for (uint8_t i = 0; i < _sack_nblocks_out; ++i) {
+            write_be<uint32_t>(off, _sack_blocks_out[i].left);  off += 4;
+            write_be<uint32_t>(off, _sack_blocks_out[i].right); off += 4;
+            size += 8;
+        }
+    }
+    if (size > 0 && syn_on) {
+        // SYN options end with EOL + NOP padding to a 4-byte boundary.
+        // (The SACK-only branch above is already 4-byte aligned by
+        // construction, so it doesn't need this.)
+        auto size_max = align_up(uint8_t(size + 1), tcp_option::align);
+        while (size < size_max - uint8_t(option_len::eol)) {
+            auto nop = tcp_option::nop();
+            nop.write(off);
+            off += option_len::nop;
+            size += option_len::nop;
+        }
+        auto eol = tcp_option::eol();
+        eol.write(off);
+        size += option_len::eol;
+    }
+    SEASTAR_ASSERT(size == options_size);
+
+    return size;
+}
+
+inline uint8_t tcp_option::get_size(bool syn_on, bool ack_on) {
+    uint8_t size = 0;
+    if (syn_on) {
+        if (_mss_received || !ack_on) {
+            size += option_len::mss;
+        }
+        if (_win_scale_received || !ack_on) {
+            size += option_len::win_scale;
+        }
+        if (_sack_received || !ack_on) {
+            size += option_len::sack;
+        }
+    } else if (_sack_nblocks_out > 0) {
+        // NOP NOP + 2-byte header + 8 per block; already 4-byte aligned.
+        size = 4 + 8 * _sack_nblocks_out;
+    }
+    if (size > 0 && syn_on) {
+        size += option_len::eol;
+        // Pad with NOPs to align on 32-bit
+        size = align_up(size, tcp_option::align);
+    }
+    return size;
+}
 
 template <typename InetTraits>
 class tcp {
@@ -1081,20 +1300,16 @@ void tcp<InetTraits>::tcb::init_from_options(tcp_hdr* th, uint8_t* opt_start, ui
     // Handle tcp options
     _option.parse(opt_start, opt_end);
 
-    // Remote receive window scale factor. RFC 7323 caps shift at 14;
-    // anything higher must be treated as 14 to avoid overflow when shifting
-    // the 16-bit window field.
-    _snd.window_scale = std::min<uint8_t>(_option._remote_win_scale, 14);
+    // Remote receive window scale factor. See clamp_window_scale() for RFC
+    // 7323 §2.3 rationale.
+    _snd.window_scale = clamp_window_scale(_option._remote_win_scale);
     // Local receive window scale factor
     _rcv.window_scale = _option._local_win_scale;
 
-    // Maximum segment size remote can receive
-    // Standard TCP rule: _snd.mss = min(remote_mss, what_we_can_actually_send).
-    // The peer's announced MSS can exceed what fits in our local MTU (Windows
-    // TCP with Large Send Offload announces MSS values like 16294 even when
-    // path MTU is much smaller). Without this cap, Seastar hands the NIC TSO
-    // blobs with tso_segsz > port MTU and frames get dropped at the PHY.
-    _snd.mss = std::min(_option._remote_mss, local_mss());
+    // Maximum segment size remote can receive. See clamp_send_mss() for the
+    // rationale; without this Seastar would hand the NIC TSO blobs whose
+    // tso_segsz exceeded the port MTU.
+    _snd.mss = clamp_send_mss(_option._remote_mss, local_mss());
     // Maximum segment size local can receive
     _rcv.mss = _option._local_mss = local_mss();
 
@@ -1106,14 +1321,9 @@ void tcp<InetTraits>::tcb::init_from_options(tcp_hdr* th, uint8_t* opt_start, ui
     // Segment acknowledgment number used for last window update
     _snd.wl2 = th->ack;
 
-    // Setup initial congestion window
-    if (2190 < _snd.mss) {
-        _snd.cwnd = 2 * _snd.mss;
-    } else if (1095 < _snd.mss && _snd.mss <= 2190) {
-        _snd.cwnd = 3 * _snd.mss;
-    } else {
-        _snd.cwnd = 4 * _snd.mss;
-    }
+    // Setup initial congestion window per RFC 6928 (IW10). See
+    // initial_cwnd_for_mss() for the formula and rationale.
+    _snd.cwnd = initial_cwnd_for_mss(_snd.mss);
 
     // Setup initial slow start threshold
     _snd.ssthresh = th->window << _snd.window_scale;
@@ -1634,6 +1844,24 @@ void tcp<InetTraits>::tcb::output_one(bool data_retransmit) {
     uint16_t len = p.len();
     bool syn_on = syn_needs_on();
     bool ack_on = ack_needs_on();
+
+    // Populate the outgoing SACK block list (RFC 2018) for this segment.
+    // Only meaningful on non-SYN segments and only when the peer advertised
+    // SACK_PERMITTED. Walk the out-of-order queue most-recent-first (highest
+    // sequence first), emit up to sack_max_blocks ranges. The map keys are
+    // already sorted; reverse iteration gives the order the RFC recommends.
+    _option._sack_nblocks_out = 0;
+    if (!syn_on && _option._sack_received) {
+        auto& ooo_map = _rcv.out_of_order.map;
+        for (auto it = ooo_map.rbegin();
+             it != ooo_map.rend() && _option._sack_nblocks_out < tcp_option::sack_max_blocks;
+             ++it) {
+            auto left = it->first;
+            auto right = left + it->second.len();
+            _option._sack_blocks_out[_option._sack_nblocks_out++] =
+                tcp_option::sack_block_out{ left.raw, right.raw };
+        }
+    }
 
     auto options_size = _option.get_size(syn_on, ack_on);
     auto th = p.prepend_uninitialized_header(tcp_hdr::len + options_size);

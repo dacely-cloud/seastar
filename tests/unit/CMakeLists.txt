@@ -314,6 +314,10 @@ seastar_add_app_test (alien
 seastar_add_test (checked_ptr
   SOURCES checked_ptr_test.cc)
 
+seastar_add_test (tcp_options
+  KIND BOOST
+  SOURCES tcp_options_test.cc)
+
 seastar_add_test (temporary_buffer
   SOURCES temporary_buffer_test.cc)
 
