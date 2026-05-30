@@ -44,15 +44,18 @@ if (dpdk_INCLUDE_DIR AND EXISTS "${dpdk_INCLUDE_DIR}/rte_build_config.h")
 endif ()
 
 set(rte_libs
+  argparse
   bus_pci
   bus_vdev
   cfgfile
   cmdline
+  common_nfp
   cryptodev
   eal
   ethdev
   hash
   kvargs
+  log
   mbuf
   mempool
   mempool_ring
@@ -154,6 +157,15 @@ foreach (lib "bsd" "numa")
     list (APPEND dpdk_dependencies ${lib})
   endif()
 endforeach ()
+
+# When the mlx5 PMD is enabled, the combined dpdk.o references symbols from
+# the userspace RDMA stack at runtime (libibverbs, libmlx5, libnl-3,
+# libnl-route-3). pkg-config only lists them in dpdk_PC_STATIC_LDFLAGS as
+# raw -l flags; thread them through dpdk_dependencies so any consumer of
+# DPDK::dpdk (libseastar.a, unit tests, our app binary) picks them up.
+if (Seastar_DPDK_MLX5)
+  list (APPEND dpdk_dependencies ibverbs mlx5 nl-3 nl-route-3)
+endif ()
 
 # As of DPDK 23.07, if libarchive-dev is present, it will make DPDK depend on the library.
 # Unfortunately DPDK also has a bug in its .pc file generation and will not include libarchive

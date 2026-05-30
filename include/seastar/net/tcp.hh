@@ -1856,8 +1856,15 @@ void tcp<InetTraits>::tcb::output_one(bool data_retransmit) {
         for (auto it = ooo_map.rbegin();
              it != ooo_map.rend() && _option._sack_nblocks_out < tcp_option::sack_max_blocks;
              ++it) {
+            unsigned plen = it->second.len();
+            if (plen == 0) {
+                // Defensive: the merger can briefly hold a 0-length entry
+                // during merging; emitting {x:x} as a SACK block is invalid
+                // per RFC 2018. Skip and try the next entry.
+                continue;
+            }
             auto left = it->first;
-            auto right = left + it->second.len();
+            auto right = left + plen;
             _option._sack_blocks_out[_option._sack_nblocks_out++] =
                 tcp_option::sack_block_out{ left.raw, right.raw };
         }
