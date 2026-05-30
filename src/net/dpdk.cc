@@ -153,6 +153,24 @@ static void tune_ring_sizes(uint16_t port_idx, const rte_eth_dev_info& info,
                       ? info.default_rxportconf.ring_size : 1024;
     uint16_t tx = info.default_txportconf.ring_size
                       ? info.default_txportconf.ring_size : 1024;
+    // Optional override for the auto-tuned RX/TX ring sizes. Bursty workloads
+    // (small responses at high RPS) overflow the NIC-recommended default
+    // (typically 256 for ConnectX-4), causing transient TX drops and
+    // RTO-driven tail-latency spikes. Bumping the ring relieves that.
+    if (const char* s = std::getenv("SEASTAR_TX_RING_SIZE")) {
+        char* end = nullptr;
+        unsigned long v = std::strtoul(s, &end, 10);
+        if (end != s && v >= 64 && v <= 32768) {
+            tx = (uint16_t)v;
+        }
+    }
+    if (const char* s = std::getenv("SEASTAR_RX_RING_SIZE")) {
+        char* end = nullptr;
+        unsigned long v = std::strtoul(s, &end, 10);
+        if (end != s && v >= 64 && v <= 32768) {
+            rx = (uint16_t)v;
+        }
+    }
     int ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_idx, &rx, &tx);
     if (ret != 0) {
         rte_exit(EXIT_FAILURE,
