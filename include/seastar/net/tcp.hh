@@ -1081,13 +1081,20 @@ void tcp<InetTraits>::tcb::init_from_options(tcp_hdr* th, uint8_t* opt_start, ui
     // Handle tcp options
     _option.parse(opt_start, opt_end);
 
-    // Remote receive window scale factor
-    _snd.window_scale = _option._remote_win_scale;
+    // Remote receive window scale factor. RFC 7323 caps shift at 14;
+    // anything higher must be treated as 14 to avoid overflow when shifting
+    // the 16-bit window field.
+    _snd.window_scale = std::min<uint8_t>(_option._remote_win_scale, 14);
     // Local receive window scale factor
     _rcv.window_scale = _option._local_win_scale;
 
     // Maximum segment size remote can receive
-    _snd.mss = _option._remote_mss;
+    // Standard TCP rule: _snd.mss = min(remote_mss, what_we_can_actually_send).
+    // The peer's announced MSS can exceed what fits in our local MTU (Windows
+    // TCP with Large Send Offload announces MSS values like 16294 even when
+    // path MTU is much smaller). Without this cap, Seastar hands the NIC TSO
+    // blobs with tso_segsz > port MTU and frames get dropped at the PHY.
+    _snd.mss = std::min(_option._remote_mss, local_mss());
     // Maximum segment size local can receive
     _rcv.mss = _option._local_mss = local_mss();
 
