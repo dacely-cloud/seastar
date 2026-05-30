@@ -1331,9 +1331,37 @@ private:
             }
         }
 
+        // Debug: dump every outbound mbuf header fields when
+        // SEASTAR_DPDK_TX_DEBUG=1. This is for diagnosing PMD-level TSO bugs.
+        static const bool tx_dbg = []{
+            const char* s = std::getenv("SEASTAR_DPDK_TX_DEBUG");
+            return s && *s && *s != '0';
+        }();
+        if (tx_dbg) {
+            for (uint16_t i = _tx_burst_idx; i < _tx_burst.size(); i++) {
+                rte_mbuf* m = _tx_burst[i];
+                bool tso = (m->ol_flags & RTE_MBUF_F_TX_TCP_SEG) != 0;
+                fprintf(stderr,
+                    "[tx] pkt_len=%u nb_segs=%u l2=%u l3=%u l4=%u "
+                    "tso_segsz=%u ol_flags=0x%lx tso=%d data_len[0]=%u\n",
+                    m->pkt_len, m->nb_segs,
+                    m->l2_len, m->l3_len, m->l4_len,
+                    m->tso_segsz, (unsigned long)m->ol_flags, tso,
+                    m->data_len);
+            }
+        }
+
         uint16_t sent = rte_eth_tx_burst(_dev->port_idx(), _qid,
                                          _tx_burst.data() + _tx_burst_idx,
                                          _tx_burst.size() - _tx_burst_idx);
+
+        if (tx_dbg && sent != _tx_burst.size() - _tx_burst_idx) {
+            fprintf(stderr,
+                "[tx] tx_burst returned %u out of %zu (NIC rejected %zu)\n",
+                (unsigned)sent,
+                (size_t)(_tx_burst.size() - _tx_burst_idx),
+                (size_t)(_tx_burst.size() - _tx_burst_idx - sent));
+        }
 
         uint64_t nr_frags = 0, bytes = 0;
 
@@ -1688,6 +1716,30 @@ int dpdk_device::init_port_start()
     }
 
     //rte_eth_promiscuous_enable(port_num);
+
+    // Set the port MTU. By default DPDK initializes the port at RTE_ETHER_MTU
+    // (1500), which silently rejects any frame larger than that at the PHY
+    // layer. SEASTAR_PORT_MTU lets the user override this for jumbo frames.
+    // Also update _hw_features.mtu so the IP/TCP layers above us know the
+    // real max frame size and emit appropriately-sized segments.
+    uint16_t mtu = 0;
+    if (const char* s = std::getenv("SEASTAR_PORT_MTU")) {
+        char* end = nullptr;
+        unsigned long v = std::strtoul(s, &end, 10);
+        if (end != s && v >= 68 && v <= 9978) {
+            mtu = (uint16_t)v;
+        }
+    }
+    if (mtu) {
+        if (rte_eth_dev_set_mtu(_port_idx, mtu) != 0) {
+            printf("Port %u: failed to set MTU to %u, keeping default\n",
+                   _port_idx, mtu);
+        } else {
+            printf("Port %u: MTU set to %u\n", _port_idx, mtu);
+            _hw_features.mtu = mtu;
+        }
+    }
+
     printf("done: \n");
 
     return 0;
